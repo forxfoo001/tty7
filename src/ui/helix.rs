@@ -38,6 +38,23 @@ impl HelixMode {
     }
 }
 
+/// Byte range `[head..next]` covered by the Helix block cursor in a `Rope`
+/// buffer. Clamps `raw_head` to a valid UTF-8 character boundary and advances
+/// over at most one non-newline code point without slicing fixed byte windows.
+pub fn block_cursor_byte_range(
+    text: &gpui_component::input::Rope,
+    raw_head: usize,
+) -> Range<usize> {
+    use gpui_component::input::RopeExt as _;
+    let len = text.len();
+    let head = text.floor_char_boundary(raw_head.min(len));
+    let next = match (head < len).then(|| text.char_at(head)).flatten() {
+        Some(ch) if ch != '\n' && ch != '\r' => (head + ch.len_utf8()).min(len),
+        _ => head,
+    };
+    head..next
+}
+
 /// Pending prefix mode entered from `Normal` or `Select` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MinorMode {
@@ -2614,5 +2631,30 @@ mod tests {
         assert_eq!(&text[splits[0].clone()], "1");
         assert_eq!(&text[splits[1].clone()], "2");
         assert_eq!(&text[splits[2].clone()], "3");
+    }
+
+    #[test]
+    fn block_cursor_byte_range_handles_multibyte_utf8_and_mid_char_offsets() {
+        let md = "1234567中\r\nCodex、WorkBuddy 和 🚀\n";
+        let rope = gpui_component::input::Rope::from(md);
+
+        // `head + 8` lands inside '中' (bytes 7..10): must still measure '1' (0..1).
+        assert_eq!(block_cursor_byte_range(&rope, 0), 0..1);
+        // Directly on 3-byte CJK character '中' (bytes 7..10).
+        assert_eq!(block_cursor_byte_range(&rope, 7), 7..10);
+        // Mid-character byte offsets inside '中' clamp safely to its start boundary.
+        assert_eq!(block_cursor_byte_range(&rope, 8), 7..10);
+        assert_eq!(block_cursor_byte_range(&rope, 9), 7..10);
+        // Line endings ('\r' and '\n') collapse to zero-width caret range.
+        assert_eq!(block_cursor_byte_range(&rope, 10), 10..10);
+        assert_eq!(block_cursor_byte_range(&rope, 11), 11..11);
+
+        // Every byte offset (including non-char boundaries and past-EOF) produces valid boundaries.
+        for raw in 0..=(md.len() + 16) {
+            let range = block_cursor_byte_range(&rope, raw);
+            assert!(rope.is_char_boundary(range.start), "start at raw={raw}");
+            assert!(rope.is_char_boundary(range.end), "end at raw={raw}");
+            assert!(range.start <= range.end);
+        }
     }
 }

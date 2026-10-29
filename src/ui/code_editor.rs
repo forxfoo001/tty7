@@ -3990,21 +3990,13 @@ impl Tty7App {
         let state = f.input.read(cx);
         let text = state.text();
         let len = text.len();
-        let head = if f.helix.anchor == f.helix.head && state.selected_range().is_empty() {
+        let raw_head = if f.helix.anchor == f.helix.head && state.selected_range().is_empty() {
             state.cursor().min(len)
         } else {
             f.helix.head.min(len)
         };
-        let next = if head < len {
-            let tail = text.slice(head..len.min(head + 8)).to_string();
-            match tail.chars().next() {
-                Some(ch) if ch != '\n' && ch != '\r' => (head + ch.len_utf8()).min(len),
-                _ => head,
-            }
-        } else {
-            head
-        };
-        let bounds = state.range_to_bounds(&(head..next))?;
+        let range = crate::ui::helix::block_cursor_byte_range(text, raw_head);
+        let bounds = state.range_to_bounds(&range)?;
         let width = bounds.size.width.max(px(8.));
         let height = bounds.size.height.max(px(16.));
         let caret_color = cx.theme().caret;
@@ -5019,5 +5011,54 @@ mod close_gpui_tests {
             app.editor_close_active_if_focused(window, cx)
         }));
         assert_eq!(panel(&app, &mut vcx), (true, 0));
+    }
+
+    /// Regression test: drawing the Helix block cursor when a multi-byte UTF-8
+    /// character (CJK / punctuation / emoji) spans `head + 8` must never slice
+    /// inside a code point during `window.draw`.
+    #[gpui::test]
+    fn helix_block_cursor_renders_across_multibyte_utf8_markdown(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+        crate::ui::i18n::set_locale("en");
+        let md = "1234567中\n# Electron DOM Mirror\n\nCodex、WorkBuddy 和 🚀\n";
+        let char_offsets: Vec<usize> = md.char_indices().map(|(i, _)| i).collect();
+
+        let id = app.update_in(&mut vcx, |app, window, cx| {
+            let cfg = cx.global_mut::<crate::core::config::Config>();
+            cfg.helix_mode = true;
+            cfg.editor_markdown_preview = false;
+
+            let host = app.active_host(cx).expect("a host");
+            let tab = app.tabs[app.active].tree_id.get();
+            let indent = crate::ui::editor_text::detect_indent(md, "markdown");
+            let id = app.editor_new_buffer(
+                host,
+                std::path::PathBuf::from("/repro/README.md"),
+                None,
+                md.to_string(),
+                crate::ui::editor_text::TextFormat::default(),
+                crate::ui::editor_text::EditorConfig::default(),
+                indent,
+                None,
+                window,
+                cx,
+            );
+            app.editor_show_in_tab(tab, id, true, window, cx);
+            id
+        });
+
+        // At head = 0, `head + 8` lands on byte 8 (middle of '中' at bytes 7..10).
+        settle(&mut vcx);
+
+        for off in char_offsets {
+            app.update_in(&mut vcx, |app, window, cx| {
+                if let Some(f) = app.buffer_mut(id) {
+                    f.helix.anchor = off;
+                    f.helix.head = off;
+                }
+                app.editor_sync_helix_selection(id, window, cx);
+            });
+            settle(&mut vcx);
+        }
     }
 }

@@ -3737,21 +3737,14 @@ impl TerminalView {
                 let state = c.input.read(cx);
                 let text = state.text();
                 let len = text.len();
-                let head = if c.helix.anchor == c.helix.head && state.selected_range().is_empty() {
-                    state.cursor().min(len)
-                } else {
-                    c.helix.head.min(len)
-                };
-                let next = if head < len {
-                    let tail = text.slice(head..len.min(head + 8)).to_string();
-                    match tail.chars().next() {
-                        Some(ch) if ch != '\n' && ch != '\r' => (head + ch.len_utf8()).min(len),
-                        _ => head,
-                    }
-                } else {
-                    head
-                };
-                let bounds = state.range_to_bounds(&(head..next))?;
+                let raw_head =
+                    if c.helix.anchor == c.helix.head && state.selected_range().is_empty() {
+                        state.cursor().min(len)
+                    } else {
+                        c.helix.head.min(len)
+                    };
+                let range = crate::ui::helix::block_cursor_byte_range(text, raw_head);
+                let bounds = state.range_to_bounds(&range)?;
                 let cell_w = bounds.size.width.max(self.cell_width.max(px(7.5)));
                 let cell_h = bounds.size.height.max(px(14.));
                 let fill_col = theme.caret.opacity(0.42);
