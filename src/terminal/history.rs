@@ -121,11 +121,34 @@ const FISH_HISTORY_FILE: &str = "fish_history";
 const FISH_HISTORY_UNDER_DATA_DIR: &str = "fish/fish_history";
 const FISH_HISTORY_UNDER_HOME: &str = ".local/share/fish/fish_history";
 
+const PSREADLINE_HISTORY_FILE: &str = "ConsoleHost_history.txt";
+
+/// PSReadLine's history relative to `APPDATA`, and relative to the home dir
+/// when APPDATA is the default `%USERPROFILE%\AppData\Roaming`. A redirected
+/// APPDATA is honoured by the local scan through the env var; a remote fetch
+/// can only try the default spelling, and a miss is skipped like any other.
+const PSREADLINE_HISTORY_UNDER_APPDATA: &str =
+    "Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt";
+const PSREADLINE_HISTORY_UNDER_HOME: &str =
+    "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt";
+
+/// pwsh on Unix keeps the same file under the XDG data dir, `~/.local/share`
+/// by default. Only the local scan reads this spelling: asking a Unix remote
+/// for it too would spend a round trip on a file that is almost never there.
+const PSREADLINE_HISTORY_UNDER_DATA_DIR: &str = "pwsh/PSReadLine/ConsoleHost_history.txt";
+
 /// History files worth fetching from a remote host, relative to its home dir.
 /// `load_with_shell_files` reads the file name back off these to pick a parser,
-/// so a name added here needs a reader in `parse_history_file`.
-pub fn shell_history_names() -> [&'static str; 3] {
-    [".zsh_history", ".bash_history", FISH_HISTORY_UNDER_HOME]
+/// so a name added here needs a reader in `parse_history_file`. The PSReadLine
+/// spelling only exists on a Windows host; everywhere else the fetch misses
+/// and is skipped, which is what a missing `.zsh_history` already does.
+pub fn shell_history_names() -> [&'static str; 4] {
+    [
+        ".zsh_history",
+        ".bash_history",
+        FISH_HISTORY_UNDER_HOME,
+        PSREADLINE_HISTORY_UNDER_HOME,
+    ]
 }
 
 fn looks_absolute(p: &str) -> bool {
@@ -328,6 +351,24 @@ fn load_shell_history() -> Vec<Raw> {
     } else if let Some(home) = std::env::var_os("HOME") {
         add(PathBuf::from(home).join(FISH_HISTORY_UNDER_HOME));
     }
+    // PSReadLine keeps one file per host name, and ConsoleHost is where an
+    // interactive shell's lines land. APPDATA is where it looks on Windows and
+    // is set independently of HOME; pwsh on Unix keeps the same file under the
+    // XDG data dir instead.
+    if let Some(appdata) = std::env::var_os("APPDATA").filter(|d| !d.is_empty()) {
+        add(PathBuf::from(appdata).join(PSREADLINE_HISTORY_UNDER_APPDATA));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        add(PathBuf::from(home).join(PSREADLINE_HISTORY_UNDER_HOME));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
+        add(PathBuf::from(xdg).join(PSREADLINE_HISTORY_UNDER_DATA_DIR));
+    } else if cfg!(not(windows))
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        add(PathBuf::from(home)
+            .join(".local/share")
+            .join(PSREADLINE_HISTORY_UNDER_DATA_DIR));
+    }
     read_shell_history_files(files)
 }
 
@@ -411,6 +452,15 @@ const ZSH_META: u8 = 0x83;
 fn decode_history_file(name: &str, bytes: &[u8]) -> String {
     if is_zsh_history(name, bytes) {
         String::from_utf8_lossy(&unmetafy(bytes)).into_owned()
+    } else if name == PSREADLINE_HISTORY_FILE {
+        // PSReadLine writes UTF-8 with a BOM it does not use anywhere else, and
+        // on a UTF-16 system console the file can be UTF-16 wholesale. Strip
+        // the BOM's bytes before from_utf8_lossy turns them into U+FEFF —
+        // which no prefix-match or ↑ recall ever typed. UTF-16 decodes to a
+        // NUL-per-char under lossy UTF-8 and every line fails the emptiness
+        // trim, so it degrades to no entries rather than garbage ones.
+        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(bytes);
+        String::from_utf8_lossy(bytes).into_owned()
     } else {
         String::from_utf8_lossy(bytes).into_owned()
     }
@@ -462,8 +512,28 @@ fn unmetafy(bytes: &[u8]) -> Vec<u8> {
 fn parse_history_file(name: &str, content: &str, out: &mut Vec<Raw>) {
     if name == FISH_HISTORY_FILE {
         parse_fish_history(content, out);
+    } else if name == PSREADLINE_HISTORY_FILE {
+        parse_psreadline_history(content, out);
     } else {
         parse_shell_history(content, out);
+    }
+}
+
+/// PSReadLine's file is one command per line and nothing else — no timestamps,
+/// no escaping, CRLF line endings. Nothing in the format marks a continuation:
+/// a trailing backtick says the *next* physical lines belong to this command,
+/// but nothing says where that command ends, so the later lines are
+/// indistinguishable from commands of their own. PSReadLine itself loses these
+/// on reload for the same reason. So: a line ending in a backtick starts a
+/// continuation and is dropped; its tail lines are kept as what they look like.
+/// A line that only looks like a continuation (`findstr /C:"`a`$"`) ends with a
+/// quote, not a backtick, and survives intact.
+fn parse_psreadline_history(content: &str, out: &mut Vec<Raw>) {
+    for raw in content.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw).trim();
+        if !line.is_empty() && !line.ends_with('`') {
+            out.push(Raw::bare(line.to_string()));
+        }
     }
 }
 
@@ -730,6 +800,78 @@ mod tests {
             shell_history_names().contains(&FISH_HISTORY_UNDER_HOME),
             "a remote host must be asked for the same file the local side reads"
         );
+    }
+
+    #[test]
+    fn the_psreadline_history_path_is_spelled_the_same_way_everywhere() {
+        assert_eq!(
+            PSREADLINE_HISTORY_UNDER_HOME,
+            format!("AppData/Roaming/{PSREADLINE_HISTORY_UNDER_APPDATA}"),
+            "the APPDATA-relative and HOME-relative spellings have drifted apart"
+        );
+        assert!(PSREADLINE_HISTORY_UNDER_HOME.ends_with(PSREADLINE_HISTORY_FILE));
+        assert!(
+            shell_history_names().contains(&PSREADLINE_HISTORY_UNDER_HOME),
+            "a remote Windows host must be asked for the same file the local side reads"
+        );
+        assert!(PSREADLINE_HISTORY_UNDER_APPDATA.ends_with(PSREADLINE_HISTORY_FILE));
+    }
+
+    fn parse_psreadline(content: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        parse_psreadline_history(content, &mut out);
+        out.into_iter().map(|r| r.cmd).collect()
+    }
+
+    #[test]
+    fn psreadline_entries_are_one_command_per_line() {
+        assert_eq!(
+            parse_psreadline("git pull\r\ncargo build --release\r\n"),
+            ["git pull".to_string(), "cargo build --release".to_string()]
+        );
+    }
+
+    #[test]
+    fn psreadline_garbage_lines_are_not_invented_into_commands() {
+        assert_eq!(parse_psreadline("\r\n  \r\n"), Vec::<String>::new());
+        assert_eq!(parse_psreadline(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_psreadline_continuation_head_is_dropped_and_its_tail_kept_as_its_own_line() {
+        // The file has no marker for where a continuation command ends, so the
+        // tail is indistinguishable from a command — kept, as PSReadLine's own
+        // reload keeps it. Only the backtick-ending head is unambiguously
+        // incomplete and dropped.
+        let content = "npm install`\r\n  --force\r\ngit status\r\n";
+        assert_eq!(
+            parse_psreadline(content),
+            ["--force".to_string(), "git status".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_psreadline_line_ending_in_a_quote_is_not_a_continuation() {
+        assert_eq!(
+            parse_psreadline("findstr /C:\"`a`$\" file\r\n"),
+            ["findstr /C:\"`a`$\" file".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_psreadline_file_is_recognized_by_its_name_and_stripped_of_its_bom() {
+        let bytes = "\u{FEFF}git pull\r\n".as_bytes();
+        let text = decode_history_file(PSREADLINE_HISTORY_FILE, bytes);
+        assert_eq!(
+            parse_history_file_for(PSREADLINE_HISTORY_FILE, &text),
+            ["git pull".to_string()]
+        );
+    }
+
+    fn parse_history_file_for(name: &str, content: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        parse_history_file(name, content, &mut out);
+        out.into_iter().map(|r| r.cmd).collect()
     }
 
     #[test]

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **PowerShell history feeds the prompt's suggestions** — The inline ghost
+  suggestion, ↑, and ⌃R now draw on PSReadLine's history file on Windows
+  (and pwsh's copy under `~/.local/share` on Unix), not only on what the pane
+  ran inside tty7. A remote Windows host's history seeds its SSH panes the
+  same way zsh, bash and fish ones always have. Commands split over a
+  backtick continuation are the file's own blind spot — nothing in it marks
+  where they end — and are left to PSReadLine's reload behaviour.
+
 ### Fixed
 
 - **An update no longer leaves pane shells off the local network on macOS** —
