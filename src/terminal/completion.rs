@@ -397,11 +397,32 @@ pub fn remote_path_candidates(req: &RemotePathRequest, entries: &[RemoteEntry]) 
     out
 }
 
+fn starts_with_ignore_case(haystack: &str, prefix: &str) -> bool {
+    let mut h = haystack.chars().flat_map(char::to_lowercase);
+    let mut p = prefix.chars().flat_map(char::to_lowercase);
+    loop {
+        match p.next() {
+            None => return true,
+            Some(pc) => {
+                if h.next() != Some(pc) {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 fn complete_path(word: &str, cwd: &Path, dirs_only: bool, quoting: Quoting) -> Vec<WordCand> {
     // Candidates are emitted unquoted and quoted at insertion time. Undo the
     // corresponding quoting for lookup, so a second Tab after inserting
     // `'My Documents'/` still enters the real directory.
     let word = unquote_word(word, quoting);
+    if word == "~" {
+        return home_dir()
+            .filter(|h| h.is_dir())
+            .map(|_| vec![WordCand::plain("~".to_string(), CandidateKind::Dir)])
+            .unwrap_or_default();
+    }
     let (dir_part, prefix) = match word.rfind(std::path::is_separator) {
         Some(i) => (&word[..=i], &word[i + 1..]),
         None => ("", word.as_str()),
@@ -412,12 +433,14 @@ fn complete_path(word: &str, cwd: &Path, dirs_only: bool, quoting: Quoting) -> V
         return Vec::new();
     };
     let mut out: Vec<WordCand> = Vec::new();
+    let mut ci_out: Vec<WordCand> = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') && !prefix.starts_with('.') {
             continue;
         }
-        if !name.starts_with(prefix) {
+        let exact = name.starts_with(prefix);
+        if !exact && !starts_with_ignore_case(&name, prefix) {
             continue;
         }
         let is_dir = entry
@@ -431,10 +454,18 @@ fn complete_path(word: &str, cwd: &Path, dirs_only: bool, quoting: Quoting) -> V
         } else {
             CandidateKind::File
         };
-        out.push(WordCand::plain(format!("{dir_part}{name}"), kind));
-        if out.len() >= MAX_CANDIDATES {
-            break;
+        let cand = WordCand::plain(format!("{dir_part}{name}"), kind);
+        if exact {
+            out.push(cand);
+            if out.len() >= MAX_CANDIDATES {
+                break;
+            }
+        } else if out.is_empty() && ci_out.len() < MAX_CANDIDATES {
+            ci_out.push(cand);
         }
+    }
+    if out.is_empty() {
+        out = ci_out;
     }
     out.sort_by(|a, b| {
         a.text
@@ -715,13 +746,18 @@ impl CompletionSession {
     }
 
     pub(super) fn refilter(&mut self, word: &str) -> bool {
-        if !word.starts_with(self.open_word.as_str()) {
+        if !starts_with_ignore_case(word, self.open_word.as_str()) {
             return false;
         }
         let selected_all = self.index.and_then(|i| self.filtered.get(i)).copied();
         self.filtered = (0..self.all.len())
             .filter(|&i| self.all[i].text.starts_with(word))
             .collect();
+        if self.filtered.is_empty() {
+            self.filtered = (0..self.all.len())
+                .filter(|&i| starts_with_ignore_case(&self.all[i].text, word))
+                .collect();
+        }
         if self.filtered.is_empty() {
             return false;
         }
@@ -1442,5 +1478,42 @@ mod tests {
             assert_eq!(resolve_dir("~/", cwd), home.clone());
             assert_eq!(resolve_dir("~/dev/", cwd), home.join("dev/"));
         }
+    }
+
+    #[test]
+    fn bare_tilde_completes_as_home_directory() {
+        if home_dir().is_some() {
+            let line = "hx ~";
+            let c = complete(line, line.chars().count(), Some(Path::new("/")), Some("zsh"))
+                .expect("bare ~ should complete in a local pane");
+            assert_eq!(c.candidates.len(), 1);
+            assert_eq!(c.candidates[0].text, "~");
+            assert!(c.candidates[0].is_dir());
+            assert_eq!((c.candidates[0].start, c.candidates[0].end), (3, 4));
+        }
+    }
+
+    #[test]
+    fn path_completion_falls_back_to_case_insensitive_prefix() {
+        let dir = temp_tree(
+            "case-fallback",
+            &[("Downloads", true), ("Documents", true), ("demo.txt", false)],
+        );
+        // Exact lowercase match exists (`demo.txt`), so exact match wins first.
+        let exact = complete("hx d", 4, Some(dir.as_path()), Some("zsh")).unwrap();
+        let exact_names: Vec<&str> = exact.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(exact_names, vec!["demo.txt"]);
+
+        // No exact match for `do`, so case-insensitive fallback finds `Documents` and `Downloads`.
+        let ci = complete("hx do", 5, Some(dir.as_path()), Some("zsh")).unwrap();
+        let ci_names: Vec<&str> = ci.candidates.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(ci_names, vec!["Documents", "Downloads"]);
+        assert!(ci.candidates.iter().all(|c| c.is_dir()));
+
+        // Refiltering an open session also falls back to case-insensitive prefix matching.
+        let mut session = CompletionSession::new(3, "do".to_string(), ci.candidates, 0);
+        session.refilter("dow");
+        assert_eq!(session.filtered.len(), 1);
+        assert_eq!(session.selected().unwrap().text, "Downloads");
     }
 }

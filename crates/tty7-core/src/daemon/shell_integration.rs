@@ -10,7 +10,7 @@ if [[ -o interactive ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
   # rc file just run and is never exported, so the history menu, which reads
   # the file directly, would otherwise only know the default ~/.zsh_history.
   # One line per distinct path, written once.
-  if [[ -n "$HISTFILE" && "$HISTFILE" == /* && -n "$TTY7_CONFIG_DIR" ]]; then
+  if [[ -n "$HISTFILE" && "$HISTFILE" == /* && "$HISTFILE" != */tty7-zdotdir-* && -n "$TTY7_CONFIG_DIR" ]]; then
     __tty7_hf_list="$TTY7_CONFIG_DIR/shell-histfiles"
     __tty7_hf_known=
     [[ -r "$__tty7_hf_list" ]] && __tty7_hf_known="$(<"$__tty7_hf_list")"
@@ -226,7 +226,7 @@ if [[ $- == *i* ]] && [[ -z "$TTY7_SHELL_INTEGRATION" ]]; then
   # rc file just run and is never exported, so the history menu, which reads
   # the file directly, would otherwise only know the default ~/.bash_history.
   # One line per distinct path, written once.
-  if [[ -n "$HISTFILE" && "$HISTFILE" == /* && -n "$TTY7_CONFIG_DIR" ]]; then
+  if [[ -n "$HISTFILE" && "$HISTFILE" == /* && "$HISTFILE" != */tty7-zdotdir-* && -n "$TTY7_CONFIG_DIR" ]]; then
     __tty7_hf_list="$TTY7_CONFIG_DIR/shell-histfiles"
     __tty7_hf_known=
     [[ -r "$__tty7_hf_list" ]] && __tty7_hf_known="$(<"$__tty7_hf_list")"
@@ -727,6 +727,7 @@ fn zsh_redirectors() -> [(&'static str, String); 4] {
         format!(
             "__tty7_ztmp=$ZDOTDIR\n\
              if [[ -n \"$TTY7_USER_ZDOTDIR\" ]]; then ZDOTDIR=$TTY7_USER_ZDOTDIR; else unset ZDOTDIR; fi\n\
+             [[ \"$HISTFILE\" == \"$__tty7_ztmp/\"* ]] && HISTFILE=\"${{ZDOTDIR:-$HOME}}/${{HISTFILE#$__tty7_ztmp/}}\"\n\
              [[ -f \"${{ZDOTDIR:-$HOME}}/{name}\" ]] && source \"${{ZDOTDIR:-$HOME}}/{name}\"\n\
              {tail}ZDOTDIR=$__tty7_ztmp\n\
              unset __tty7_ztmp\n"
@@ -3036,6 +3037,56 @@ mod tests {
             ZSH_INTEGRATION.contains("add-zsh-hook -d precmd __tty7_restore_zdotdir"),
             "the restore hook must deregister itself so it runs exactly once"
         );
+    }
+
+    #[test]
+    fn zsh_redirectors_relocate_histfile_away_from_throwaway_zdotdir() {
+        let files = zsh_redirectors();
+        let zshrc = &files[2].1;
+        let aim = zshrc.find("ZDOTDIR=$TTY7_USER_ZDOTDIR").unwrap();
+        let relocate = zshrc
+            .find(r#"[[ "$HISTFILE" == "$__tty7_ztmp/"* ]] && HISTFILE="${ZDOTDIR:-$HOME}/${HISTFILE#$__tty7_ztmp/}""#)
+            .expect("rewrites HISTFILE when /etc/zshrc pointed it at the throwaway ZDOTDIR");
+        let source = zshrc.find("source \"${ZDOTDIR:-$HOME}/.zshrc\"").unwrap();
+        assert!(
+            aim < relocate && relocate < source,
+            "HISTFILE must be relocated after ZDOTDIR is restored and before sourcing user .zshrc"
+        );
+
+        #[cfg(unix)]
+        if let Some(home) = throwaway_dir("tty7-zsh-hist-home-") {
+            let ztmp = home.join("tty7-zdotdir-123");
+            std::fs::create_dir_all(&ztmp).unwrap();
+            for (name, body) in &files {
+                std::fs::write(ztmp.join(name), body).unwrap();
+            }
+            // Simulate Oh My Zsh's `[ -z "$HISTFILE" ] && HISTFILE="$HOME/.zsh_history"`
+            // after macOS `/etc/zshrc` set `HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history`.
+            std::fs::write(
+                home.join(".zshrc"),
+                "[ -z \"$HISTFILE\" ] && HISTFILE=\"$HOME/.zsh_history\"\n",
+            )
+            .unwrap();
+            let script = format!(
+                "ZDOTDIR='{ztmp}'; HISTFILE=\"${{ZDOTDIR:-$HOME}}/.zsh_history\"; source '{ztmp}/.zshrc'; printf '%s\\n' \"$HISTFILE\"",
+                ztmp = ztmp.display()
+            );
+            if let Ok(out) = std::process::Command::new("zsh")
+                .args(["-f", "-c", &script])
+                .env("HOME", &home)
+                .env_remove("TTY7_USER_ZDOTDIR")
+                .output()
+                && out.status.success()
+            {
+                let got = String::from_utf8_lossy(&out.stdout);
+                assert_eq!(
+                    got.trim(),
+                    home.join(".zsh_history").to_string_lossy(),
+                    "HISTFILE must point at the user's real dir, not the throwaway ZDOTDIR"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 
     #[test]

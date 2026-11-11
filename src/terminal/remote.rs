@@ -102,6 +102,7 @@ struct ReaderSignals {
     zle_reading: Arc<AtomicBool>,
     shell_vi_mode: Arc<AtomicBool>,
     running_command: Arc<Mutex<String>>,
+    submitted_commands: Arc<Mutex<Vec<(String, u64)>>>,
     auth: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
     phase: Arc<Mutex<Option<SshPhase>>>,
     /// Kitty-graphics images the daemon lifted out of the stream (issue #213),
@@ -612,6 +613,7 @@ pub struct RemoteTerminal {
     /// client: the frame the daemon sends says a command runs, not which one.
     /// The close confirmation has to name what it is about to end.
     running_command: Arc<Mutex<String>>,
+    submitted_commands: Arc<Mutex<Vec<(String, u64)>>>,
     auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>>,
     ssh_phase: Arc<Mutex<Option<SshPhase>>>,
     ssh_endpoint: Option<(String, u16)>,
@@ -979,6 +981,7 @@ impl RemoteTerminal {
                 zle_reading: self.zle_reading.clone(),
                 shell_vi_mode: self.shell_vi_mode.clone(),
                 running_command: self.running_command.clone(),
+                submitted_commands: self.submitted_commands.clone(),
                 auth: self.auth_prompts.clone(),
                 phase: self.ssh_phase.clone(),
                 images: self.images.clone(),
@@ -1083,6 +1086,7 @@ impl RemoteTerminal {
         let zle_reading = Arc::new(AtomicBool::new(false));
         let shell_vi_mode = Arc::new(AtomicBool::new(false));
         let running_command: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let submitted_commands: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
         let auth_prompts: Arc<Mutex<VecDeque<(u64, AuthPromptKind)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let ssh_phase: Arc<Mutex<Option<SshPhase>>> = Arc::new(Mutex::new(None));
@@ -1113,6 +1117,7 @@ impl RemoteTerminal {
                 zle_reading: zle_reading.clone(),
                 shell_vi_mode: shell_vi_mode.clone(),
                 running_command: running_command.clone(),
+                submitted_commands: submitted_commands.clone(),
                 auth: auth_prompts.clone(),
                 phase: ssh_phase.clone(),
                 images: images.clone(),
@@ -1149,6 +1154,7 @@ impl RemoteTerminal {
             zle_reading,
             shell_vi_mode,
             running_command,
+            submitted_commands,
             auth_prompts,
             ssh_phase,
             ssh_endpoint: None,
@@ -1233,6 +1239,7 @@ impl RemoteTerminal {
                     zle_reading,
                     shell_vi_mode,
                     running_command,
+                    submitted_commands,
                     auth,
                     phase,
                     images,
@@ -1427,6 +1434,13 @@ impl RemoteTerminal {
                                                     .strip_prefix(b"C;")
                                                     .map(|c| String::from_utf8_lossy(c).into_owned())
                                                     .unwrap_or_default();
+                                                if !line.is_empty() {
+                                                    let seq =
+                                                        shell.lock().map(|s| s.seq).unwrap_or(0);
+                                                    if let Ok(mut q) = submitted_commands.lock() {
+                                                        q.push((line.clone(), seq));
+                                                    }
+                                                }
                                                 if let Ok(mut cmd) = running_command.lock() {
                                                     *cmd = line;
                                                 }
@@ -2163,6 +2177,13 @@ impl RemoteTerminal {
         self.running_command
             .lock()
             .map(|c| c.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn take_submitted_commands(&self) -> Vec<(String, u64)> {
+        self.submitted_commands
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
             .unwrap_or_default()
     }
 

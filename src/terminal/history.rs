@@ -393,7 +393,12 @@ fn parse_reported_history_files(text: &str) -> Vec<PathBuf> {
         .lines()
         .rev()
         .map(str::trim)
-        .filter(|line| looks_absolute(line) && seen.insert(*line))
+        .filter(|line| {
+            looks_absolute(line)
+                && !line.contains("/tty7-zdotdir-")
+                && !line.contains("\\tty7-zdotdir-")
+                && seen.insert(*line)
+        })
         .take(32)
         .map(PathBuf::from)
         .collect();

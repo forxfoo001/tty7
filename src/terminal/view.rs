@@ -508,6 +508,7 @@ pub struct TerminalView {
     history_prefix: String,
     last_word_nav: Option<LastWordWalk>,
     pending_history: Option<PendingHistory>,
+    shared_history_seq: u64,
     completion: Option<CompletionSession>,
     remote_completion_inflight: bool,
     /// Why the last remote listing produced nothing, when it failed: "no
@@ -663,6 +664,23 @@ struct PendingHistory {
     ts: u64,
     seq: u64,
 }
+
+#[derive(Clone)]
+struct SharedHistoryEntry {
+    seq: u64,
+    scope: super::history::Scope,
+    line: String,
+    cwd: Option<String>,
+    ts: u64,
+}
+
+#[derive(Default)]
+struct SharedHistoryLog {
+    next_seq: u64,
+    entries: Vec<SharedHistoryEntry>,
+}
+
+impl gpui::Global for SharedHistoryLog {}
 
 struct LastWordWalk {
     entry: usize,
@@ -2064,6 +2082,7 @@ impl TerminalView {
             history_prefix: String::new(),
             last_word_nav: None,
             pending_history: None,
+            shared_history_seq: 0,
             completion: None,
             completion_generation: 0,
             editor_handoff: None,
@@ -2633,6 +2652,7 @@ impl TerminalView {
         }
         match ev {
             AlacEvent::Wakeup => {
+                self.sync_shared_history(cx);
                 // The grid moved under whatever the search bar last measured.
                 self.note_output_under_search(cx);
                 // Only a pane that is on screen repaints on output. The
@@ -3106,8 +3126,14 @@ impl TerminalView {
                 cx.notify();
                 return;
             }
-            if key == "r" && !cx.global::<Config>().history_search {
-                self.handoff_line_to_shell(&[0x12], cx);
+            if key == "r" {
+                if !cx.global::<Config>().history_search {
+                    self.handoff_line_to_shell(&[0x12], cx);
+                } else {
+                    self.sync_shared_history(cx);
+                    self.start_reverse_search();
+                    cx.notify();
+                }
                 return;
             }
             if self.apply_readline_ctrl(key) {
@@ -3308,6 +3334,7 @@ impl TerminalView {
                     cx.notify();
                 }
                 HostAction::OpenSearchBar | HostAction::GlobalSearch => {
+                    self.sync_shared_history(cx);
                     self.start_reverse_search();
                     cx.notify();
                 }
@@ -4359,6 +4386,8 @@ impl TerminalView {
         }
         let at_prompt = self.terminal.at_prompt();
 
+        self.sync_shared_history(cx);
+
         if self
             .pending_history
             .as_ref()
@@ -4616,6 +4645,7 @@ impl TerminalView {
                     return;
                 }
                 view.install_loaded_history(loaded);
+                view.sync_shared_history(cx);
                 let cwd = view.ranked_cwd.clone();
                 view.rerank_history(cwd.as_deref());
                 cx.notify();
@@ -4652,6 +4682,7 @@ impl TerminalView {
             }
         }
         self.history_nav = None;
+        self.shared_history_seq = 0;
         self.history_ready = true;
     }
 
@@ -5441,35 +5472,7 @@ impl TerminalView {
         self.flush_typeahead();
         let line = self.cmd.text();
         if !line.trim().is_empty() {
-            let cwd = self.cwd();
-            let now = unix_now();
-            *self.history_counts.entry(line.clone()).or_insert(0) += 1;
-            if let Some(dir) = cwd.as_ref().and_then(|p| p.to_str()) {
-                self.history_cwds
-                    .entry(line.clone())
-                    .or_default()
-                    .insert(dir.to_string());
-            }
-            self.history_meta.insert(
-                line.clone(),
-                super::history::EntryMeta {
-                    ts: Some(now),
-                    exit: None,
-                },
-            );
-            // One entry per command, at its latest run: the same global
-            // dedup `normalize` applies on load, so ↑ does not step onto a
-            // command twice and a restart does not reorder anything.
-            self.history.retain(|h| *h != line);
-            self.history.push(line.clone());
-            self.flush_pending_history();
-            self.pending_history = Some(PendingHistory {
-                line: line.clone(),
-                cwd: cwd.clone(),
-                ts: now,
-                seq: self.terminal.prompt_seq(),
-            });
-            self.rerank_history(cwd.as_deref());
+            self.record_history_entry(line.clone(), self.terminal.prompt_seq(), cx);
         }
         // The dedup above can shift entries down, so nothing may keep an
         // index into `history` across a submit.
@@ -5493,7 +5496,138 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn record_history_entry(&mut self, line: String, seq: u64, cx: &mut Context<Self>) {
+        self.sync_shared_history_log(cx);
+        let cwd = self.cwd();
+        let now = unix_now();
+        let cwd_str = cwd.as_ref().and_then(|p| p.to_str()).map(str::to_string);
+        *self.history_counts.entry(line.clone()).or_insert(0) += 1;
+        if let Some(dir) = &cwd_str {
+            self.history_cwds
+                .entry(line.clone())
+                .or_default()
+                .insert(dir.clone());
+        }
+        self.history_meta.insert(
+            line.clone(),
+            super::history::EntryMeta {
+                ts: Some(now),
+                exit: None,
+            },
+        );
+        // One entry per command, at its latest run: the same global
+        // dedup `normalize` applies on load, so ↑ does not step onto a
+        // command twice and a restart does not reorder anything.
+        self.history.retain(|h| *h != line);
+        self.history.push(line.clone());
+        self.flush_pending_history();
+        self.pending_history = Some(PendingHistory {
+            line: line.clone(),
+            cwd: cwd.clone(),
+            ts: now,
+            seq,
+        });
+        if !cx.global::<Config>().per_pane_history {
+            let log = cx.default_global::<SharedHistoryLog>();
+            log.next_seq += 1;
+            let entry_seq = log.next_seq;
+            log.entries.push(SharedHistoryEntry {
+                seq: entry_seq,
+                scope: self.history_scope.clone(),
+                line,
+                cwd: cwd_str,
+                ts: now,
+            });
+            if log.entries.len() > 512 {
+                let drain = log.entries.len() - 512;
+                log.entries.drain(0..drain);
+            }
+            self.shared_history_seq = entry_seq;
+        }
+        self.rerank_history(cwd.as_deref());
+    }
+
+    fn drain_submitted_commands(&mut self, cx: &mut Context<Self>) {
+        for (raw_mark, seq) in self.terminal.take_submitted_commands() {
+            if raw_mark.contains("%0A") {
+                continue;
+            }
+            let line = unescape_mark_text(&raw_mark);
+            if line.trim().is_empty() {
+                continue;
+            }
+            if self
+                .pending_history
+                .as_ref()
+                .is_some_and(|p| p.seq == seq || p.line == line || p.line.starts_with(&line))
+            {
+                continue;
+            }
+            self.record_history_entry(line, seq, cx);
+            self.history_nav = None;
+            self.last_word_nav = None;
+            self.history_stash.clear();
+            self.history_prefix.clear();
+        }
+    }
+
+    fn sync_shared_history(&mut self, cx: &mut Context<Self>) {
+        self.drain_submitted_commands(cx);
+        self.sync_shared_history_log(cx);
+    }
+
+    fn sync_shared_history_log(&mut self, cx: &mut Context<Self>) {
+        if cx.global::<Config>().per_pane_history || !self.history_ready {
+            return;
+        }
+        let Some(log) = cx.try_global::<SharedHistoryLog>() else {
+            return;
+        };
+        if log.next_seq <= self.shared_history_seq {
+            return;
+        }
+        let unseen: Vec<SharedHistoryEntry> = log
+            .entries
+            .iter()
+            .filter(|e| e.seq > self.shared_history_seq && e.scope == self.history_scope)
+            .cloned()
+            .collect();
+        self.shared_history_seq = log.next_seq;
+        if unseen.is_empty() {
+            return;
+        }
+        for entry in unseen {
+            let already_loaded = self
+                .history_meta
+                .get(&entry.line)
+                .and_then(|m| m.ts)
+                .is_some_and(|ts| ts >= entry.ts);
+            if !already_loaded {
+                *self.history_counts.entry(entry.line.clone()).or_insert(0) += 1;
+                if let Some(dir) = entry.cwd {
+                    self.history_cwds
+                        .entry(entry.line.clone())
+                        .or_default()
+                        .insert(dir);
+                }
+                self.history_meta.insert(
+                    entry.line.clone(),
+                    super::history::EntryMeta {
+                        ts: Some(entry.ts),
+                        exit: None,
+                    },
+                );
+            }
+            self.history.retain(|h| *h != entry.line);
+            self.history.push(entry.line);
+        }
+        self.history_nav = None;
+        let cwd = self.ranked_cwd.clone();
+        self.rerank_history(cwd.as_deref());
+    }
+
     fn insert_last_word(&mut self, cx: &mut Context<Self>) {
+        self.sync_shared_history(cx);
         let resumed = self.last_word_nav.take().filter(|walk| {
             let len = walk.word.chars().count();
             self.cmd.cursor() == walk.at + len
@@ -5545,6 +5679,7 @@ impl TerminalView {
     /// because ↓ past the newest match has to restore what was typed, cursor
     /// tail included.
     fn history_prev(&mut self, cx: &mut Context<Self>) {
+        self.sync_shared_history(cx);
         let from = match self.history_nav {
             None => {
                 let line = self.cmd.text();
@@ -6238,6 +6373,7 @@ impl TerminalView {
             return;
         }
         if self.input_active() {
+            self.sync_shared_history(cx);
             self.adopt_typeahead();
             self.cmd.insert_str(text);
             self.history_nav = None;
@@ -13722,6 +13858,75 @@ mod gpui_tests {
             None,
             "the fresh line must not keep going raw to the shell"
         );
+    }
+
+    #[gpui::test]
+    fn command_submitted_in_shell_after_tab_handoff_is_recorded_in_history(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (window, mut daemon) = harness(cx);
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for_input_active(&window, cx);
+
+        window
+            .update(cx, |view, window, cx| {
+                view.history = vec!["hx old_file.rs".to_string()];
+                view.history_frecency = vec![1.0];
+                for ch in ["h", "x", " ", "z", "z", "q", "q", "x"] {
+                    type_char(view, ch, window, cx);
+                }
+                view.complete_tab(true, cx);
+                assert!(!view.input_active(), "Tab handed this line to the shell");
+            })
+            .unwrap();
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            Some(b"hx zzqqx".to_vec())
+        );
+        assert_eq!(next_input_until_timeout(&mut daemon), Some(b"\t".to_vec()));
+
+        // Shell completes and executes the handed-off command, emitting OSC 133;C;<cmd>,
+        // then finishes and returns to the next prompt.
+        DaemonMsg::Output(b"\x1b]133;C;hx ~/Downloads/persona_manifest.json\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: false,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        DaemonMsg::Output(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: Some(0),
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for_input_active(&window, cx);
+
+        window
+            .update(cx, |view, window, cx| {
+                for ch in ["h", "x", " "] {
+                    type_char(view, ch, window, cx);
+                }
+                view.history_prev(cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "hx ~/Downloads/persona_manifest.json",
+                    "pressing Up with prefix `hx ` must recall the command executed after shell handoff"
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]
