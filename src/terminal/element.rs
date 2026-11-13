@@ -380,7 +380,7 @@ pub(super) struct PaintColors {
 /// outside the grid and stay at full brightness, where the old style faded
 /// the whole `TerminalView` — the same "the fading is worn by what it holds"
 /// rule the drag grip follows.
-fn dim_under(cx: &gpui::App) -> Rgba {
+pub(super) fn dim_under(cx: &gpui::App) -> Rgba {
     // Mirror `workspace_background`: the active preset fill when a preset is
     // installed, the theme token otherwise. The alpha is the window opacity
     // in both arms, so the premultiply is uniform.
@@ -438,7 +438,7 @@ fn premultiplied(packed: u32, opacity: f32) -> Rgba {
 /// in the composited result: painting `blend_toward(a)` over `blend_toward(b)`
 /// equals `blend_toward(a over b)`, which is exactly what a uniform opacity
 /// of `dim` over the window background would produce.
-fn blend_toward(c: Hsla, dim: f32, under: Rgba) -> Hsla {
+pub(super) fn blend_toward(c: Hsla, dim: f32, under: Rgba) -> Hsla {
     let c = Rgba::from(c);
     Rgba {
         r: dim * c.r + (1. - dim) * under.r,
@@ -447,6 +447,33 @@ fn blend_toward(c: Hsla, dim: f32, under: Rgba) -> Hsla {
         a: c.a,
     }
     .into()
+}
+
+/// Opaque background colour matching what this pane sits on: `theme_bg`
+/// composited over the active backdrop under-colour and dimmed by `dim`. Used
+/// by DOM overlays (such as the input bar) that must cover existing grid
+/// glyphs underneath without letting them bleed through.
+pub(super) fn opaque_cell_bg(theme_bg: Hsla, dim: f32, cx: &gpui::App) -> Hsla {
+    let bg = Rgba::from(theme_bg);
+    let under = dim_under(cx);
+    let opaque: Hsla = if bg.a >= 1. {
+        theme_bg
+    } else {
+        let a = bg.a.clamp(0., 1.);
+        Rgba {
+            r: bg.r * a + under.r * (1. - a),
+            g: bg.g * a + under.g * (1. - a),
+            b: bg.b * a + under.b * (1. - a),
+            a: 1.,
+        }
+        .into()
+    };
+    let dim = dim.clamp(0., 1.);
+    if dim < 1. {
+        blend_toward(opaque, dim, under)
+    } else {
+        opaque
+    }
 }
 
 impl PaintColors {
@@ -2267,7 +2294,7 @@ impl Element for TerminalElement {
         let rows = fits.saturating_sub(reserved).max(1);
 
         self.view.update(cx, |view, cx| {
-            view.set_grid_size(
+            let changed = view.set_grid_size(
                 cols,
                 rows,
                 cell_width,
@@ -2278,7 +2305,7 @@ impl Element for TerminalElement {
             // Whatever lays itself over the bottom rows (the composer)
             // measures up from the bottom, past this.
             let slack = bounds.size.height - line_height * fits as f32;
-            if view.grid_slack != slack {
+            if changed || view.grid_slack != slack {
                 view.grid_slack = slack;
                 cx.notify();
             }

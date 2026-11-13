@@ -1732,7 +1732,10 @@ pub fn retitle(title: &str) -> Vec<u8> {
 /// matter of taste — see that constant.
 pub fn restore_preamble(banner: Option<&str>) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(b"\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[0m");
+    // Reset alternate screen, visible cursor, autowrap, SGR, scroll margins
+    // (DECSTBM) and origin mode (DECOM) so a trimmed snapshot from a TUI app
+    // cannot confine subsequent cursor positioning (including `\x1b[H`).
+    out.extend_from_slice(b"\x1b[?1049l\x1b[?25h\x1b[?7h\x1b[0m\x1b[r\x1b[?6l");
     out.extend_from_slice(INPUT_MODE_RESETS);
     if let Some(banner) = banner.map(str::trim).filter(|b| !b.is_empty()) {
         out.extend_from_slice(b"\r\n\x1b[2m\xe2\x94\x80\xe2\x94\x80 ");
@@ -5574,16 +5577,33 @@ mod tests {
     fn a_pane_with_nothing_to_say_still_gets_the_resets() {
         for banner in [None, Some(""), Some("   ")] {
             let text = String::from_utf8(restore_preamble(banner)).unwrap();
-            assert!(
-                text.starts_with("\x1b[?1049l"),
-                "the terminal still has to be handed back in a usable state"
-            );
-            assert!(
-                !text.contains('\n'),
-                "with no words there is no rule to draw, so no line is spent on one"
-            );
-        }
+        assert!(
+            text.starts_with("\x1b[?1049l"),
+            "the terminal still has to be handed back in a usable state"
+        );
+        assert!(
+            !text.contains('\n'),
+            "with no words there is no rule to draw, so no line is spent on one"
+        );
     }
+}
+
+#[test]
+fn restore_preamble_resets_scroll_margins_and_origin_mode() {
+    let text = String::from_utf8(restore_preamble(Some("restored"))).unwrap();
+    let decstbm = text
+        .find("\x1b[r")
+        .expect("DECSTBM reset must be emitted in restore preamble");
+    let decom = text
+        .find("\x1b[?6l")
+        .expect("DECOM reset must be emitted in restore preamble");
+    if cfg!(windows) {
+        let home = text.rfind("\x1b[H").unwrap();
+        assert!(decstbm < home && decom < home);
+    } else {
+        assert!(decstbm < text.len() && decom < text.len());
+    }
+}
 
     #[test]
     fn ring_idle_resizes_collapse_and_replay_ends_at_current_size() {

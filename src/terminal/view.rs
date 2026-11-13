@@ -896,21 +896,15 @@ const BUSY_COMMAND_MAX: usize = 60;
 /// it cannot break OSC framing: `%` and the four control bytes. Anything else
 /// is left exactly as the user typed it.
 fn unescape_mark_text(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(i) = rest.find('%') {
-        out.push_str(&rest[..i]);
-        let tail = &rest[i..];
-        let (decoded, width) = match tail.get(..3) {
-            Some("%25") => ("%", 3),
-            Some("%1B") | Some("%07") | Some("%0D") => ("", 3),
-            Some("%0A") => (" ", 3),
-            _ => ("%", 1),
-        };
-        out.push_str(decoded);
-        rest = &tail[width..];
+    let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+    let mut out = String::with_capacity(decoded.len());
+    for ch in decoded.chars() {
+        match ch {
+            '\x1b' | '\x07' | '\r' => {}
+            '\n' => out.push(' '),
+            _ => out.push(ch),
+        }
     }
-    out.push_str(rest);
     out
 }
 
@@ -2110,7 +2104,7 @@ impl TerminalView {
         line_height: Pixels,
         scale: f32,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         // A column change reflows every wrapped line, and a match point is an
         // absolute (line, column) against the width it was scanned at — so
         // the highlights keep washing the *old* positions until something
@@ -2119,8 +2113,12 @@ impl TerminalView {
         // the resize indefinitely (#586). Rescan with the output path's
         // discipline — it keeps the selection and never scrolls. Rows alone
         // reflow nothing, so a height-only drag stays cheap.
-        let cols_changed = cols != self.terminal.size().cols;
-        if (cols, rows) != (self.terminal.size().cols, self.terminal.size().rows) {
+        let old_size = self.terminal.size();
+        let cols_changed = cols != old_size.cols;
+        let grid_changed = (cols, rows) != (old_size.cols, old_size.rows);
+        let cell_changed = self.cell_width != cell_width || self.line_height != line_height;
+        let old_cursor = self.cursor_cell();
+        if grid_changed {
             self.last_hover_cell = None;
             self.hovered_link = None;
         }
@@ -2147,6 +2145,7 @@ impl TerminalView {
         if cols_changed && self.search.is_some() {
             self.refresh_matches_after_output(cx);
         }
+        grid_changed || cell_changed || self.cursor_cell() != old_cursor
     }
 
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
@@ -2960,6 +2959,7 @@ impl TerminalView {
                     if !self.cmd.delete_selection() {
                         self.cmd.delete_to_start();
                     }
+                    self.reset_history_nav();
                     self.close_completion();
                     self.cursor_visible = true;
                     cx.notify();
@@ -2973,6 +2973,7 @@ impl TerminalView {
                     if !self.cmd.delete_selection() {
                         self.cmd.delete_to_end();
                     }
+                    self.reset_history_nav();
                     self.close_completion();
                     self.cursor_visible = true;
                     cx.notify();
@@ -2990,6 +2991,7 @@ impl TerminalView {
         let key = ks.key.as_str();
         self.cursor_visible = true;
         self.jump_to_prompt();
+        self.engage_hold_into_editor();
         self.adopt_typeahead();
 
         let aliased;
@@ -3049,6 +3051,7 @@ impl TerminalView {
                 }
                 (false, "backspace") if self.cmd.selection().is_none() && !self.cmd.is_empty() => {
                     self.cmd.backspace();
+                    self.reset_history_nav();
                     self.completion_refilter();
                     self.cursor_visible = true;
                     cx.notify();
@@ -3105,7 +3108,7 @@ impl TerminalView {
                         if !self.cmd.delete_selection() {
                             self.cmd.delete_word_left();
                         }
-                        self.history_nav = None;
+                        self.reset_history_nav();
                         cx.notify();
                         return;
                     }
@@ -3113,6 +3116,7 @@ impl TerminalView {
                         if !self.cmd.delete_selection() {
                             self.cmd.delete_word_right();
                         }
+                        self.reset_history_nav();
                         cx.notify();
                         return;
                     }
@@ -3166,7 +3170,7 @@ impl TerminalView {
                     if !self.cmd.delete_selection() {
                         self.cmd.delete_word_right();
                     }
-                    self.history_nav = None;
+                    self.reset_history_nav();
                     cx.notify();
                     return;
                 }
@@ -3193,7 +3197,7 @@ impl TerminalView {
                 } else {
                     self.cmd.backspace();
                 }
-                self.history_nav = None;
+                self.reset_history_nav();
             }
             "delete" => {
                 if m.alt {
@@ -3201,12 +3205,14 @@ impl TerminalView {
                 } else {
                     self.cmd.delete();
                 }
+                self.reset_history_nav();
             }
             "left" => self.editor_move_h(false, m.shift, m.alt),
             "right" => {
                 if !m.shift && self.cmd.selection().is_none() {
                     if let Some(full) = self.ghost_suggestion() {
                         self.cmd.set(&full);
+                        self.reset_history_nav();
                         cx.notify();
                         return;
                     }
@@ -3318,7 +3324,7 @@ impl TerminalView {
                 }
                 self.cmd
                     .replace_byte_range(range, &new_text, new_anchor, new_head);
-                self.history_nav = None;
+                self.reset_history_nav();
                 cx.notify();
             }
             HelixOutcome::Host(action) => match action {
@@ -3326,11 +3332,13 @@ impl TerminalView {
                 HostAction::Undo => {
                     self.cmd.undo();
                     self.cmd.sync_to_helix();
+                    self.reset_history_nav();
                     cx.notify();
                 }
                 HostAction::Redo => {
                     self.cmd.redo();
                     self.cmd.sync_to_helix();
+                    self.reset_history_nav();
                     cx.notify();
                 }
                 HostAction::OpenSearchBar | HostAction::GlobalSearch => {
@@ -3340,6 +3348,9 @@ impl TerminalView {
                 }
                 _ => {
                     self.cmd.sync_from_helix();
+                    if self.cmd.text() != text {
+                        self.reset_history_nav();
+                    }
                     cx.notify();
                 }
             },
@@ -3358,6 +3369,7 @@ impl TerminalView {
                     && let Some(full) = self.ghost_suggestion()
                 {
                     self.cmd.set(&full);
+                    self.reset_history_nav();
                 } else {
                     self.cmd.clear_selection();
                     self.cmd.move_end();
@@ -3370,6 +3382,7 @@ impl TerminalView {
             "f" => {
                 if let Some(full) = self.ghost_suggestion() {
                     self.cmd.set(&full);
+                    self.reset_history_nav();
                 } else {
                     self.cmd.clear_selection();
                     self.cmd.move_right();
@@ -3379,25 +3392,34 @@ impl TerminalView {
                 if !self.cmd.delete_selection() {
                     self.cmd.delete_path_component_left();
                 }
+                self.reset_history_nav();
             }
             "u" => {
                 if !self.cmd.delete_selection() {
                     self.cmd.delete_to_start();
                 }
+                self.reset_history_nav();
             }
             "k" => {
                 if !self.cmd.delete_selection() {
                     self.cmd.delete_to_end();
                 }
+                self.reset_history_nav();
             }
-            "h" => self.cmd.backspace(),
-            "y" => self.cmd.yank(),
+            "h" => {
+                self.cmd.backspace();
+                self.reset_history_nav();
+            }
+            "y" => {
+                self.cmd.yank();
+                self.reset_history_nav();
+            }
             "l" => {
                 self.terminal.write(vec![0x0c]);
             }
             "c" => {
                 self.cmd.clear();
-                self.history_nav = None;
+                self.reset_history_nav();
                 let _ = self.typeahead.drain();
                 let _ = self.hold.engage();
                 self.terminal.write(vec![0x03]);
@@ -3408,6 +3430,7 @@ impl TerminalView {
                     self.terminal.write(vec![0x04]);
                 } else {
                     self.cmd.delete();
+                    self.reset_history_nav();
                 }
             }
             _ => return false,
@@ -3633,9 +3656,11 @@ impl TerminalView {
         // this function used to do on its own.
         self.jump_to_prompt();
         if self.input_active() {
+            self.engage_hold_into_editor();
+            self.adopt_typeahead();
             let trimmed = text.strip_suffix('\n').unwrap_or(&text);
             self.cmd.insert_pasted(trimmed);
-            self.history_nav = None;
+            self.reset_history_nav();
             self.editor_goal_col = None;
             self.close_completion();
             self.cursor_visible = true;
@@ -3907,6 +3932,7 @@ impl TerminalView {
         } else {
             self.cmd.undo();
         }
+        self.reset_history_nav();
         self.close_completion();
         cx.notify();
     }
@@ -3918,6 +3944,7 @@ impl TerminalView {
         if let Some(text) = self.cmd.selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             self.cmd.delete_selection();
+            self.reset_history_nav();
             self.close_completion();
             self.cursor_visible = true;
             cx.notify();
@@ -4659,6 +4686,7 @@ impl TerminalView {
     /// in flight that it does not already hold — as the most recent entries,
     /// which is what they are.
     fn install_loaded_history(&mut self, loaded: super::history::History) {
+        let active = self.active_history_entry();
         let previous = std::mem::replace(&mut self.history, loaded.entries);
         let mut counts = std::mem::replace(&mut self.history_counts, loaded.counts);
         let mut cwds = std::mem::replace(&mut self.history_cwds, loaded.cwds);
@@ -4681,7 +4709,7 @@ impl TerminalView {
                 self.history.push(line);
             }
         }
-        self.history_nav = None;
+        self.remap_history_nav(active);
         self.shared_history_seq = 0;
         self.history_ready = true;
     }
@@ -5423,7 +5451,7 @@ impl TerminalView {
         self.close_completion();
         self.cursor_visible = true;
         self.cmd.insert_str("\n");
-        self.history_nav = None;
+        self.reset_history_nav();
         self.editor_goal_col = None;
         self.last_word_nav = None;
         cx.notify();
@@ -5476,10 +5504,8 @@ impl TerminalView {
         }
         // The dedup above can shift entries down, so nothing may keep an
         // index into `history` across a submit.
-        self.history_nav = None;
+        self.reset_history_nav();
         self.last_word_nav = None;
-        self.history_stash.clear();
-        self.history_prefix.clear();
         self.close_completion();
 
         let bracketed = self
@@ -5549,25 +5575,24 @@ impl TerminalView {
 
     fn drain_submitted_commands(&mut self, cx: &mut Context<Self>) {
         for (raw_mark, seq) in self.terminal.take_submitted_commands() {
-            if raw_mark.contains("%0A") {
+            if raw_mark.contains("%0A") || raw_mark.contains("%0a") {
                 continue;
             }
             let line = unescape_mark_text(&raw_mark);
             if line.trim().is_empty() {
                 continue;
             }
-            if self
-                .pending_history
-                .as_ref()
-                .is_some_and(|p| p.seq == seq || p.line == line || p.line.starts_with(&line))
-            {
+            if self.pending_history.as_ref().is_some_and(|p| {
+                p.seq == seq
+                    || p.line == line
+                    || (p.line.contains('\n') && p.line.starts_with(&line))
+            }) {
                 continue;
             }
+            let active = self.active_history_entry();
             self.record_history_entry(line, seq, cx);
-            self.history_nav = None;
+            self.remap_history_nav(active);
             self.last_word_nav = None;
-            self.history_stash.clear();
-            self.history_prefix.clear();
         }
     }
 
@@ -5596,6 +5621,7 @@ impl TerminalView {
         if unseen.is_empty() {
             return;
         }
+        let active = self.active_history_entry();
         for entry in unseen {
             let already_loaded = self
                 .history_meta
@@ -5621,7 +5647,7 @@ impl TerminalView {
             self.history.retain(|h| *h != entry.line);
             self.history.push(entry.line);
         }
-        self.history_nav = None;
+        self.remap_history_nav(active);
         let cwd = self.ranked_cwd.clone();
         self.rerank_history(cwd.as_deref());
     }
@@ -5668,8 +5694,32 @@ impl TerminalView {
         self.cmd.insert_str(&word);
         let at = self.cmd.cursor() - word.chars().count();
         self.last_word_nav = Some(LastWordWalk { entry, at, word });
-        self.history_nav = None;
+        self.reset_history_nav();
         cx.notify();
+    }
+
+    fn reset_history_nav(&mut self) {
+        self.history_nav = None;
+        self.history_stash.clear();
+        self.history_prefix.clear();
+    }
+
+    fn active_history_entry(&self) -> Option<String> {
+        let i = self.history_nav?;
+        let entry = self.history.get(i)?;
+        (self.cmd.text() == *entry).then(|| entry.clone())
+    }
+
+    fn remap_history_nav(&mut self, active: Option<String>) {
+        if let Some(entry) = active {
+            if let Some(idx) = self.history.iter().rposition(|h| *h == entry) {
+                self.history_nav = Some(idx);
+            } else {
+                self.reset_history_nav();
+            }
+        } else {
+            self.reset_history_nav();
+        }
     }
 
     /// Walk older history, matching the prefix captured when navigation
@@ -5854,6 +5904,7 @@ impl TerminalView {
                 self.reverse_search = None;
                 if let Some(line) = line {
                     self.cmd.set(&line);
+                    self.reset_history_nav();
                 }
             }
             reverse_search::Action::Run(line) => {
@@ -6345,6 +6396,7 @@ impl TerminalView {
         }
         .apply();
         self.cmd.set_with_cursor(&line, cursor);
+        self.reset_history_nav();
     }
 
     pub fn input_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -6374,9 +6426,10 @@ impl TerminalView {
         }
         if self.input_active() {
             self.sync_shared_history(cx);
+            self.engage_hold_into_editor();
             self.adopt_typeahead();
             self.cmd.insert_str(text);
-            self.history_nav = None;
+            self.reset_history_nav();
             self.editor_goal_col = None;
             self.last_word_nav = None;
             self.completion_refilter();
@@ -7479,41 +7532,47 @@ impl TerminalView {
         );
     }
 
-    fn render_input_bar(&self, focused: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let (crow, ccol) = self.cursor_cell().unwrap_or((0, 0));
+    fn render_input_bar(&self, focused: bool, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let (crow, ccol) = self.cursor_cell()?;
         let cx_left = px(GRID_PAD_X) + self.cell_width * (ccol as f32);
         let shift = self.input_scroll_rows();
         let cy_top = px(GRID_PAD_Y) + self.line_height * (crow as f32 - shift as f32);
 
+        let theme = cx.theme();
+        let cell_bg = super::element::opaque_cell_bg(theme.background, self.dim, cx);
+
         if let Some(rs) = &self.reverse_search {
             let label = format!("(reverse-i-search)`{}': ", rs.query());
             let matched = one_line(rs.selected_line(&self.history).unwrap_or_default());
-            return div()
-                .absolute()
-                .left(cx_left)
-                .top(cy_top)
-                .right_4()
-                .h(self.line_height)
-                // The row floats over live grid cells; a bare div inserts no
-                // hitbox, so a click aimed at it started a selection in the
-                // text underneath (#541).
-                .occlude()
-                .flex()
-                .items_center()
-                .font_family(self.font.family.clone())
-                .text_size(self.font_size)
-                .child(
-                    div()
-                        .whitespace_nowrap()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .whitespace_nowrap()
-                        .text_color(cx.theme().foreground)
-                        .child(matched),
-                );
+            return Some(
+                div()
+                    .absolute()
+                    .left(cx_left)
+                    .top(cy_top)
+                    .right_4()
+                    .h(self.line_height)
+                    .bg(cell_bg)
+                    // The row floats over live grid cells; a bare div inserts no
+                    // hitbox, so a click aimed at it started a selection in the
+                    // text underneath (#541).
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .font_family(self.font.family.clone())
+                    .text_size(self.font_size)
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .text_color(theme.foreground)
+                            .child(matched),
+                    ),
+            );
         }
 
         let chars: Vec<char> = self.cmd.text().chars().collect();
@@ -7523,12 +7582,21 @@ impl TerminalView {
         let has_marked = !marked.is_empty();
         let selection = self.cmd.selection();
 
-        let theme = cx.theme();
         let fg = theme.foreground;
         let caret_col = theme.caret;
         let muted = theme.muted_foreground;
-        let mut sel_bg = theme.selection;
-        sel_bg.a = 0.55;
+        // Composite the selection tint over `cell_bg` so selected cells stay
+        // opaque and never bleed existing grid glyphs underneath through.
+        let sel_bg: gpui::Hsla = {
+            let mut s = gpui::Rgba::from(theme.selection);
+            let b = gpui::Rgba::from(cell_bg);
+            let a = 0.55;
+            s.r = s.r * a + b.r * (1. - a);
+            s.g = s.g * a + b.g * (1. - a);
+            s.b = s.b * a + b.b * (1. - a);
+            s.a = 1.;
+            s.into()
+        };
         let cell_w = self.cell_width;
         let lh = self.line_height;
         let caret_h = px((self.font_size.as_f32() * 1.2).min(lh.as_f32()));
@@ -7602,6 +7670,8 @@ impl TerminalView {
                 d = d.bg(caret_col);
             } else if selected {
                 d = d.bg(sel_bg);
+            } else {
+                d = d.bg(cell_bg);
             }
             if underline {
                 d = d.border_b_1().border_color(fg);
@@ -7648,6 +7718,7 @@ impl TerminalView {
                     lines.last_mut().unwrap().push(
                         blank(cell_w)
                             .relative()
+                            .bg(cell_bg)
                             .child(caret_bar())
                             .into_any_element(),
                     );
@@ -7687,7 +7758,7 @@ impl TerminalView {
                     last.push(cell(fg, mc.text.clone(), mc.width, false, false, true));
                 }
             } else if ghost.is_none() {
-                let mut tail = blank(cell_w).relative();
+                let mut tail = blank(cell_w).relative().bg(cell_bg);
                 if can_show_caret && cursor_on {
                     tail = tail.child(caret_bar());
                 }
@@ -7714,19 +7785,21 @@ impl TerminalView {
                 .children(cells)
         });
 
-        div()
-            .absolute()
-            .left(px(GRID_PAD_X))
-            .top(cy_top)
-            .right_4()
-            .min_h(lh)
-            .flex()
-            .flex_col()
-            .font_family(self.font.family.clone())
-            .text_size(self.font_size)
-            .line_height(lh)
-            .text_color(fg)
-            .children(rows)
+        Some(
+            div()
+                .absolute()
+                .left(px(GRID_PAD_X))
+                .top(cy_top)
+                .right_4()
+                .min_h(lh)
+                .flex()
+                .flex_col()
+                .font_family(self.font.family.clone())
+                .text_size(self.font_size)
+                .line_height(lh)
+                .text_color(fg)
+                .children(rows),
+        )
     }
 
     fn render_completion_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
@@ -8195,7 +8268,8 @@ impl Render for TerminalView {
         let focused = self.focus_handle.is_focused(window);
         let input_bar = self
             .input_active()
-            .then(|| self.render_input_bar(focused, cx));
+            .then(|| self.render_input_bar(focused, cx))
+            .flatten();
         let completion_menu = self
             .input_active()
             .then(|| self.render_completion_menu(cx))
@@ -9366,6 +9440,11 @@ mod tests {
         // the next two characters.
         assert_eq!(unescape_mark_text("50% off"), "50% off");
         assert_eq!(unescape_mark_text("cargo build"), "cargo build");
+        // PowerShell `[Uri]::EscapeDataString` percent-encodes spaces, slashes,
+        // and non-ASCII UTF-8 bytes inside OSC 133;C.
+        assert_eq!(unescape_mark_text("git%20status"), "git status");
+        assert_eq!(unescape_mark_text("cat%20foo%2Fbar"), "cat foo/bar");
+        assert_eq!(unescape_mark_text("echo%20%E4%B8%AD%E6%96%87"), "echo 中文");
     }
 
     #[test]
@@ -19165,5 +19244,159 @@ mod prompt_handover_tests {
             "",
             "the pane beside it never saw the press, so it hears nothing"
         );
+    }
+
+    #[gpui::test]
+    fn shared_history_updates_and_loaded_history_preserve_active_navigation_and_stash(
+        cx: &mut TestAppContext,
+    ) {
+        let key = |spec: &str| gpui::Keystroke::parse(spec).unwrap();
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.history = vec!["git status".to_string(), "git log".to_string()];
+                view.cmd.set("git ");
+
+                view.handle_editor_key(&key("up"), cx);
+                assert_eq!(view.cmd.text(), "git log");
+                assert!(view.history_nav.is_some());
+
+                // Simulate another pane pushing an entry into SharedHistoryLog
+                // while this pane is actively navigating history.
+                {
+                    let log = cx.default_global::<super::SharedHistoryLog>();
+                    log.next_seq += 1;
+                    let seq = log.next_seq;
+                    log.entries.push(super::SharedHistoryEntry {
+                        seq,
+                        scope: view.history_scope.clone(),
+                        line: "ls -la".to_string(),
+                        cwd: None,
+                        ts: 1,
+                    });
+                }
+                view.sync_shared_history(cx);
+                assert!(
+                    view.history_nav.is_some(),
+                    "background shared history sync must remap history_nav instead of dropping it"
+                );
+                assert_eq!(view.cmd.text(), "git log");
+
+                // Simulate async loaded history replacing `self.history` mid-navigation.
+                view.install_loaded_history(crate::terminal::history::History {
+                    entries: vec![
+                        "echo first".to_string(),
+                        "git status".to_string(),
+                        "git log".to_string(),
+                    ],
+                    counts: Default::default(),
+                    cwds: Default::default(),
+                    meta: Default::default(),
+                });
+                assert!(
+                    view.history_nav.is_some(),
+                    "install_loaded_history must remap active navigation index"
+                );
+
+                view.handle_editor_key(&key("up"), cx);
+                assert_eq!(view.cmd.text(), "git status");
+                view.handle_editor_key(&key("down"), cx);
+                assert_eq!(view.cmd.text(), "git log");
+                view.handle_editor_key(&key("down"), cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "git ",
+                    "stashed typed prefix must still be restored after background history updates"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn editing_recalled_history_clears_nav_so_next_up_keeps_the_edit(cx: &mut TestAppContext) {
+        let key = |spec: &str| gpui::Keystroke::parse(spec).unwrap();
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.history = vec!["git status".to_string(), "git log".to_string()];
+                view.handle_editor_key(&key("up"), cx);
+                assert_eq!(view.cmd.text(), "git log");
+
+                // Deleting inside the recalled entry begins a fresh edited line.
+                view.handle_editor_key(&key("delete"), cx);
+                view.cmd.backspace();
+                assert_eq!(view.cmd.text(), "git lo");
+
+                view.handle_editor_key(&key("up"), cx);
+                assert_eq!(view.cmd.text(), "git log");
+                view.handle_editor_key(&key("down"), cx);
+                assert_eq!(
+                    view.cmd.text(),
+                    "git lo",
+                    "edited command must be stashed instead of overwritten by stale history_nav"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn shorter_submitted_mark_after_longer_pending_is_not_dropped(cx: &mut TestAppContext) {
+        let (window, mut daemon) = harness(cx);
+        prompt(&mut daemon, true);
+        settle(cx, &window, "initial prompt ready", |view| view.terminal.at_prompt());
+        output(&mut daemon, b"\x1b]133;C;git%20status\x07\r\n");
+        settle(cx, &window, "first percent-encoded command arrives", |view| {
+            view.pending_history
+                .as_ref()
+                .is_some_and(|p| p.line == "git status")
+        });
+
+        let first_seq = window
+            .update(cx, |view, _, _| view.terminal.prompt_seq())
+            .unwrap();
+        prompt(&mut daemon, true);
+        settle(cx, &window, "prompt seq advances", |view| {
+            view.terminal.prompt_seq() > first_seq
+        });
+        output(&mut daemon, b"\x1b]133;C;git\x07\r\n");
+        settle(cx, &window, "shorter second command is still recorded", |view| {
+            view.history.iter().any(|h| h == "git")
+        });
+    }
+
+    #[gpui::test]
+    fn set_grid_size_reports_layout_changes_and_input_bar_skips_missing_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                // Establish initial known size so a width-only or cell-size-only
+                // change returns `true` for prepaint relayout notification.
+                view.set_grid_size(80, 24, px(8.), px(17.), 1., cx);
+                assert!(
+                    !view.set_grid_size(80, 24, px(8.), px(17.), 1., cx),
+                    "unchanged grid and cell dimensions should not dirty layout"
+                );
+                assert!(
+                    view.set_grid_size(100, 24, px(8.), px(17.), 1., cx),
+                    "width change with constant height/slack must still trigger relayout"
+                );
+                assert!(
+                    view.set_grid_size(100, 24, px(9.), px(17.), 1., cx),
+                    "cell metric change must trigger relayout"
+                );
+
+                // When cursor_cell() is None (cursor scrolled above display_offset),
+                // render_input_bar must skip rendering instead of anchoring at (0, 0).
+                view.terminal
+                    .term
+                    .lock()
+                    .scroll_display(alacritty_terminal::grid::Scroll::PageUp);
+                if view.cursor_cell().is_none() {
+                    assert!(view.render_input_bar(true, cx).is_none());
+                }
+            })
+            .unwrap();
     }
 }
